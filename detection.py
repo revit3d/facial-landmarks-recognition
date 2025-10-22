@@ -9,7 +9,7 @@ import seaborn as sns
 
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
-from torch.optim.swa_utils import AveragedModel, update_bn
+from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
@@ -79,7 +79,7 @@ class FaceImageDataset(Dataset):
             return transformed['image'], torch.Tensor(target)
         else:
             transformed = self.transform(image=image)
-            return transformed['image'], torch.Tensor(img_size)
+            return transformed['image'], torch.tensor(img_size, dtype=int)
 
 
 def remap_keypoints(keypoints, **_):
@@ -338,7 +338,7 @@ class Trainer:
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler = None,
-        logger: SummaryWriter | None = None,
+        logger = None,
         swa_model: AveragedModel | None = None,
         device: str | torch.device = 'cpu',
     ):
@@ -431,7 +431,7 @@ def detect(model_path: str, images_path: str) -> dict:
     """
     device = 'cpu'
 
-    model = UNet()  #AveragedModel(UNet())
+    model = AveragedModel(UNet())
     model.load_state_dict(torch.load(model_path, weights_only=True))
     model = model.to(device)
     model.eval()
@@ -463,9 +463,14 @@ def detect(model_path: str, images_path: str) -> dict:
     for inputs, img_sizes in loader:
         inputs = inputs.to(device)
         output = model(inputs)
-        output_coo = heatmaps_to_coords(output.cpu())
-        output_coo *= img_sizes[:, None, :] / 100
-        for coo in output_coo:
+        for i, heatmaps in enumerate(output):
+            up_heatmaps = nn.functional.interpolate(
+                heatmaps.unsqueeze(0), 
+                size=img_sizes[i].tolist(),
+                mode='bilinear',
+                align_corners=False,
+            )
+            coo = heatmaps_to_coords(up_heatmaps.cpu())
             file_name = next(files)
             predictions[file_name] = coo.view(-1).round().tolist()
     return predictions
@@ -520,7 +525,7 @@ def train_detector(
         steps_per_epoch=len(train_loader),
         epochs=hparams['epochs'],
     )
-    logger = None if fast_train else SummaryWriter(log_dir=hparams['log_dir'])
+    logger = None #if fast_train else SummaryWriter(log_dir=hparams['log_dir'])
     trainer = Trainer(
         model=model.to(device),
         criterion=weighted_mse_loss,
