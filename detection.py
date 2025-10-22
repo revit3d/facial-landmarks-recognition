@@ -5,13 +5,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import albumentations as A
-import seaborn as sns
+# import seaborn as sns
 
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
-from torch.optim.swa_utils import AveragedModel
+from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 
@@ -193,13 +193,23 @@ def visualize(inputs, targets, outputs=None, n=16):
     return fig
 
 
-def heatmaps_to_coords(heatmaps):
-    b, n, _, w = heatmaps.shape
-    heatmaps_reshaped = heatmaps.view(b, n, -1)
-    max_idx = heatmaps_reshaped.argmax(-1)
-    y = (max_idx // w).float()
-    x = (max_idx % w).float()
-    coords = torch.stack((x, y), dim=-1)
+def heatmaps_to_coords(heatmaps, beta=100.0):
+    """Soft argmax"""
+    b, n, h, w = heatmaps.shape
+    heatmaps = heatmaps.view(b, n, -1)
+    prob = torch.softmax(heatmaps * beta, dim=2).cpu()
+
+    ys, xs = torch.meshgrid(
+        torch.arange(h),
+        torch.arange(w),
+        indexing='ij'
+    )
+    xs = xs.reshape(-1)
+    ys = ys.reshape(-1)
+
+    exp_x = (prob * xs).sum(dim=2)
+    exp_y = (prob * ys).sum(dim=2)
+    coords = torch.stack([exp_x, exp_y], dim=2)
     return coords
 
 
@@ -234,7 +244,7 @@ class SEBlock(nn.Module):
             nn.Linear(in_ch, in_ch // reduction, bias=False),
             nn.SiLU(),
             nn.Linear(in_ch // reduction, in_ch, bias=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
     def forward(self, x):
         b, c, _, _ = x.size()
@@ -424,6 +434,7 @@ class Trainer:
         return val_losses
 
 
+@torch.no_grad
 def detect(model_path: str, images_path: str) -> dict:
     """
     Load model from `model_path` and make predictions for all images
@@ -453,7 +464,7 @@ def detect(model_path: str, images_path: str) -> dict:
 
     loader = DataLoader(
         dataset,
-        batch_size=16,
+        batch_size=4,
         num_workers=0,
         shuffle=False,
     )
@@ -489,11 +500,11 @@ def train_detector(
     device = 'cpu' if fast_train else get_device()
 
     hparams = {
-        'sigma': 2,
+        'sigma': 3,
         'optimizer': 'AdamW',
         'lr': 5e-4,
         'weight_decay': 5e-4,
-        'batch_size': 32,
+        'batch_size': 2 if fast_train else 32,
         'img_size': '100x100',
         'scheduler': 'OneCycleLR',
         'max_lr': 5e-3,
@@ -525,7 +536,7 @@ def train_detector(
         steps_per_epoch=len(train_loader),
         epochs=hparams['epochs'],
     )
-    logger = None #if fast_train else SummaryWriter(log_dir=hparams['log_dir'])
+    logger = None  # if fast_train else SummaryWriter(log_dir=hparams['log_dir'])
     trainer = Trainer(
         model=model.to(device),
         criterion=weighted_mse_loss,
@@ -540,4 +551,21 @@ def train_detector(
     if logger:
         logger.add_hparams(hparams, {'val_loss': val_losses[-1]})
         logger.close()
-    return trainer.model.cpu()
+
+    n_epochs = 1 if fast_train else 20
+    trainer.swa_model = AveragedModel(model)
+    trainer.scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs * len(train_loader), eta_min=1e-8,
+    )
+    new_lr = 1e-6
+    for param_group in trainer.optimizer.param_groups:
+        param_group['lr'] = new_lr
+    for state in trainer.optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+    # trainer.logger=SummaryWriter(log_dir='./logs/pretrained_model1')
+    trainer.train(train_loader, val_loader, n_epochs, fast_train)
+    swa_model = trainer.swa_model.cpu()
+    update_bn(train_loader, swa_model)
+    return swa_model.cpu()
